@@ -1,0 +1,106 @@
+# PRAXIS dependencies, pinned exactly. §2 forbids adding to this list casually.
+#
+# Not present, and deliberately: cloud SDKs, telemetry, analytics, feature flags, a broker
+# other than Redis, an ORM other than SQLAlchemy, or anything that phones home. R6 is tested
+# against this file as well as against the source.
+#
+# requirements.lock carries the hashes and is what an install should use. See D15.
+#
+# Every pin below is the version the suite actually passed on, read back from the installed
+# environment rather than chosen. See D41: a pin that nobody has run is a guess, and installing
+# from a guess is how a reproducible run stops being reproducible.
+#
+# That rule applies to the lock's transitive pins too, and it had stopped being true of them. A
+# plain `uv pip compile` resolves against whatever PyPI offers on the day, and the lock had
+# drifted ahead of this machine in forty packages - starlette 1.7.0 against the 1.3.1 the media
+# endpoint's range tests were written and measured on, among them. None of those forty was a
+# direct dependency, so nothing here had moved and nothing looked wrong. Regenerate both locks
+# together, and constrain the universal one to what is installed:
+#
+#   python scripts/freeze_constraints.py
+#   python -m uv pip compile requirements.txt --universal --generate-hashes \
+#       --constraint constraints.generated.txt -o requirements.lock
+#   python -m uv pip compile requirements.txt --python-platform x86_64-unknown-linux-gnu \
+#       --python-version 3.14 --generate-hashes \
+#       --extra-index-url https://download.pytorch.org/whl/cpu \
+#       --index-strategy unsafe-best-match -o requirements.linux-cpu.lock
+#
+# The second has no constraint and must not have one: it is the resolution a platform this suite
+# has never run on will get, and pinning it to Windows-measured versions would be a claim about
+# an environment nobody measured. Its header says so, and says why the container needs its own
+# file at all. uv rewrites that header on every compile, so the prose above the generated line
+# in that file has to be put back by hand.
+#
+# The consequence of leaving it unconstrained is that the container resolves starlette 1.7.0
+# while this machine holds 1.3.1, and the media endpoint hands HTTP Range handling entirely to
+# starlette's FileResponse. That was checked rather than assumed: the same 55 MB blurred file was
+# served through both, and all nine cases the range tests assert came back identical - full body,
+# an exact 100-byte window, open-ended, suffix, 416 carrying the true size, a clamped overrun,
+# 400 on a malformed header, multipart/byteranges at full length, and HEAD with no body. No
+# `content-disposition` from either, which is R1 and D76. So the versions are not forced to
+# match, and the reason they need not be is written down here rather than rediscovered.
+
+# --- core -------------------------------------------------------------------------------
+numpy==2.5.1
+scipy==1.17.1
+pyyaml==6.0.3
+pydantic==2.13.4
+pydantic-settings==2.14.2
+
+# --- ML. CPU locally; the CUDA build is selected on Kaggle and Colab, not pinned here ----
+# torch reports 2.13.0+cpu at runtime and 2.13.0 in its metadata. The local version comes
+# from the index, not the pin, which is why the pin carries no +cpu.
+torch==2.13.0
+torchvision==0.28.0
+
+# --- analysis: Phase 2 agreement and Phase 5 calibration --------------------------------
+pandas==3.0.5
+scikit-learn==1.9.0
+statsmodels==0.15.0
+matplotlib==3.11.0
+
+# --- explanation fidelity: Phase 7 ------------------------------------------------------
+# Structural similarity, which Adebayo et al.'s sanity checks measure explanation agreement
+# with. The canonical implementation rather than a hand-rolled one: SSIM is a published metric
+# the thesis reports, and owning a second implementation of it is how two numbers that should
+# be identical stop being so. Rank correlation comes from scipy, already pinned above.
+scikit-image==0.26.0
+
+# --- video and pose: Phase 1 and Phase 3 ------------------------------------------------
+# onnxruntime ships an AzureExecutionProvider. The pose runner pins CPUExecutionProvider
+# explicitly; R6 is not left to the default provider list. See D43.
+opencv-python-headless==4.11.0.86
+onnxruntime==1.30.0
+ultralytics==8.4.150
+
+# --- service layer: Phase 8 onward ------------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.51.0
+sqlalchemy==2.0.52
+alembic==1.20.0
+psycopg[binary]==3.3.5
+celery==5.6.3
+redis==8.1.0
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.32
+
+# --- development -------------------------------------------------------------------------
+pytest==9.1.1
+pytest-cov==7.1.0
+ruff==0.16.7
+
+# Both were installed but undeclared, which is the drift this file exists to stop, and both earn
+# the line they take up.
+#
+# pytest-randomly shuffles the order every run and prints the seed it used, so a failure stays
+# reproducible with `-p randomly --randomly-seed=<n>`. It is here because six tests were found
+# passing by file and failing by suite: each asserted a corpus-wide figure against a database
+# that other tests had written to, and in a fixed alphabetical order that stays green until a
+# new test file sorts earlier. A fixed order cannot find that class; this can.
+#
+# pytest-xdist gives each worker its own process, and so its own session scratch database. `-n
+# auto` is a convenience on a six-minute suite rather than a guarantee of anything, and the
+# ordering guard above is what the correctness argument rests on.
+pytest-randomly==3.16.0
+pytest-xdist==3.8.0

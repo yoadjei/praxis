@@ -1,0 +1,165 @@
+# PRAXIS services.
+#
+# D10 made the worker an ordinary service: local work is CPU-only, so a container loses
+# nothing, and training happens on Kaggle and Colab where Docker is not involved at all.
+#
+# NEVER EXECUTED. Docker is not installed on the development machine, so every claim this file
+# makes is checked by reading rather than by running, and the first `docker compose up` should be
+# treated as a first run. What has been fixed is what made it certainly broken: `praxis.api.main`
+# and `praxis.tasks.celery_app` did not exist, and both the image command and the worker command
+# named them. The frontend was a dev server with nothing building the bundle.
+#
+# Before that first run, move Docker's data root to B:/praxis/docker (Settings > Resources >
+# Advanced > Disk image location): C: has under 20 GB free against the 15-20 GB Docker Desktop
+# plus these images need, and D17 keeps project data off C: regardless.
+#
+# Required in the environment: POSTGRES_PASSWORD, PRAXIS_MEDIA_ROOT, PRAXIS_WEIGHTS. Each is
+# declared with `:?` so a missing one stops the run with a message instead of starting a service
+# that cannot work.
+#
+# Five services and no others, per BUILD-SPEC Phase 0. `frontend` is dev-only and does not start
+# by default, because the api image now serves the built bundle itself.
+
+name: praxis
+
+services:
+  postgres:
+    # Must track the local cluster's major version. The append-only triggers that carry R5 are
+    # proved against 18 on a developer machine, and a container on a different major would be
+    # a second, unproved environment claiming the same guarantee. See D44.
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: praxis
+      POSTGRES_USER: praxis_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      # /var/lib/postgresql, NOT /var/lib/postgresql/data. From 18 the official image stores
+      # data in a major-version subdirectory (18/docker) so that `pg_upgrade --link` can run
+      # without crossing a mount boundary, and it refuses to start when it finds a volume
+      # mounted at the old path - which reads as "PostgreSQL data in an unused mount/volume"
+      # and restart-loops. Mounting the parent is what 18+ asks for.
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U praxis_app -d praxis"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Migrations before the server, in one command. The schema a running API assumes has to exist
+    # before it answers a request, and a separate init service would be a sixth service where
+    # BUILD-SPEC Phase 0 allows five. Safe at one replica, which is all a loopback-bound
+    # single-box deployment runs; alembic's DDL is transactional, so a racing second copy fails
+    # rather than half-applies.
+    command: ["sh", "-c",
+              "python -m alembic upgrade head && exec uvicorn praxis.api.main:app --host 0.0.0.0 --port 8000"]
+    environment:
+      PRAXIS_DEVICE: cpu
+      PRAXIS_MEDIA_ROOT: /media
+      DATABASE_URL: postgresql+psycopg://praxis_app:${POSTGRES_PASSWORD}@postgres:5432/praxis
+      # PRAXIS_BROKER_URL, which is the name `praxis.tasks.broker_url()` reads and the only one
+      # it reads. This said REDIS_URL, which nothing in the system reads, so the broker was
+      # declared and never found: `select_queue()` saw no broker, returned `RecordingQueue`, and
+      # every ingest in the deployed stack appended a session id to a list in the API process
+      # and dropped it. Redis was up and healthy throughout, and nothing reported a problem.
+      PRAXIS_BROKER_URL: redis://redis:6379/0
+      # The image bakes the built bundle and serves it, so there is one deployable and not two.
+      PRAXIS_SERVE_FRONTEND: "1"
+    volumes:
+      # The external SSD, read-only to the API: it serves blurred media and never writes it.
+      - ${PRAXIS_MEDIA_ROOT:?set PRAXIS_MEDIA_ROOT}:/media:ro
+      # Vendored weights, read-only. Mounted and not baked: 200 MB of binary belongs in neither a
+      # git history nor an image layer, and R6 forbids fetching them at runtime, so an image built
+      # without them would refuse every pose call with no recovery. D58.
+      - ${PRAXIS_WEIGHTS:?set PRAXIS_WEIGHTS to the vendored weights directory}:/app/weights:ro
+      - ./configs:/app/configs:ro
+    ports:
+      # Loopback only. R6: nothing here is reachable off the box.
+      #
+      # The host half is a variable because 8000 is the most contested port on any development
+      # machine, and this one already had something answering on it - the stack came up with
+      # postgres, redis and the worker healthy and then failed with "ports are not available",
+      # which reads as a broken compose file rather than as one port being busy. Set
+      # PRAXIS_API_PORT to move it. The container half stays 8000 so nothing inside has to know.
+      - "127.0.0.1:${PRAXIS_API_PORT:-8000}:8000"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["celery", "-A", "praxis.tasks.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    environment:
+      PRAXIS_DEVICE: cpu
+      PRAXIS_MEDIA_ROOT: /media
+      DATABASE_URL: postgresql+psycopg://praxis_app:${POSTGRES_PASSWORD}@postgres:5432/praxis
+      # See the api service: this has to be the name broker_url() reads. Under REDIS_URL the
+      # worker started on celery's in-process `memory://` transport, reported itself ready,
+      # consumed from a broker no other process could reach, and failed its own healthcheck -
+      # `celery inspect ping` builds a second memory:// transport of its own, so the ping and
+      # the worker were in separate universes and no node ever replied.
+      PRAXIS_BROKER_URL: redis://redis:6379/0
+      ULTRALYTICS_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      # Read-write: Phase 3 writes the blurred copy and deletes the original.
+      - ${PRAXIS_MEDIA_ROOT:?set PRAXIS_MEDIA_ROOT}:/media
+      - ${PRAXIS_WEIGHTS:?set PRAXIS_WEIGHTS to the vendored weights directory}:/app/weights:ro
+      - ./configs:/app/configs:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "celery", "-A", "praxis.tasks.celery_app", "inspect", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # Development only, and behind a profile so it does not start by default. The api image bakes
+  # the built bundle and serves it at "/", so a plain `docker compose up` is the deployment and
+  # this service would be a second, differently-built copy of the same page answering on another
+  # port. It stays because vite's hot reload is worth having while editing the frontend:
+  #     docker compose --profile dev up
+  frontend:
+    profiles: ["dev"]
+    image: node:22-alpine
+    working_dir: /app
+    command: ["sh", "-c", "npm ci && npm run dev -- --host 0.0.0.0"]
+    volumes:
+      - ./frontend:/app
+      - frontend_modules:/app/node_modules
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  frontend_modules:

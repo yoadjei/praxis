@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "praxis"
+version = "0.1.0"
+description = "Practicum Recording, Analysis and eXplainable Inference System"
+readme = "README.md"
+# BUILD-SPEC section 2 pins 3.11 exactly. The installed interpreter is 3.14.6 and D11 defers
+# the pin rather than abandoning it: phases 0, 2-analysis, 5 and 6 are arithmetic over NumPy
+# and SciPy and are not sensitive to the minor version, and training happens on Kaggle and
+# Colab, which supply their own. The floor below is deliberately not the pin. Before Phase 4,
+# either a 3.11 environment exists or section 2 is formally relaxed with its reproducibility
+# cost stated. Until then no local number may be called reproducible on the pinned interpreter.
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+include = ["praxis*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The seven invariants are never skipped. -ra surfaces any skip or xfail immediately, and
+# --strict-markers stops a typo'd marker from quietly disabling a test.
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error::DeprecationWarning:praxis.*"]
+
+[tool.ruff]
+line-length = 96
+target-version = "py311"
+# `imported/` is a staged verbatim port from the predecessor project, kept as a visible step
+# with its own tests rather than silently copied into `praxis/`. Its value is that it can be
+# diffed against the original, and reformatting it to satisfy a linter would destroy exactly
+# that. It is excluded here rather than annotated file by file, because a hundred `noqa`
+# comments would be the same damage spelled differently. Code graduating out of `imported/`
+# into `praxis/` is linted like everything else.
+exclude = ["imported"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+# Two house conventions the linter reads as mistakes. Both are deliberate and both are argued
+# here rather than suppressed at 160 call sites.
+#
+# UP009 - the `# -*- coding: utf-8 -*-` first line. Redundant to the interpreter since Python
+# 3, and kept anyway: it is the marker this project uses to assert that a file is one of its
+# own and was written whole, and it is uniform across every module. A rule that would strip it
+# from 148 files is a rule about a convention, not about a defect.
+#
+# N818 - exceptions whose names do not end in "Error". `WeightsMissing`, `ArtefactCorrupt`,
+# `MediaRootUnavailable` and `ManifestNotFound` are named as statements of what is wrong,
+# because that is what the operator has to act on, and `ArtefactCorruptError` says nothing the
+# shorter name does not. The names that genuinely describe a category of failure - `PhaseError`,
+# `PoseError`, `PersistError` - already carry the suffix.
+#
+# UP042 - `class ScaleType(str, Enum)` rewritten as `StrEnum`. Refused because it is not a
+# cosmetic change: `StrEnum.__str__` returns the bare value where `(str, Enum).__str__` returns
+# "ScaleType.BOOLEAN", and these three enums - ScaleType, HeadKind, ShiftLevel - are written
+# into artefact JSON and into the database. Taking the fix would silently alter recorded values
+# and make a replayed run disagree with the run it replays, which is R7 broken by a linter.
+ignore = ["UP009", "N818", "UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+# A script run as `python scripts/thing.py` has to put the repository on `sys.path` before it
+# can import `praxis`, so its imports cannot come first. The alternative is requiring an
+# editable install before any script works, which would make the tooling harder to run than
+# the thing it operates on. `tests/conftest.py` does the same for the same reason.
+"scripts/*.py" = ["E402"]
+"tests/conftest.py" = ["E402"]
+# `import torch.nn.functional as F` is how every PyTorch codebase spells it, this one included.
+"praxis/behaviour/losses.py" = ["N812"]
+# `init_T` is the initial temperature of temperature scaling, named T after the literature it
+# comes from. It is also a config key, so the name is part of the file the thesis ships: a
+# rename would make every existing configs/*.yaml invalid in order to satisfy a naming rule.
+"praxis/config_schema.py" = ["N815"]

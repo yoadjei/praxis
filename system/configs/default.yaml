@@ -1,0 +1,559 @@
+# PRAXIS default configuration
+#
+# Every tunable value in the system lives here. Rule R7 depends on it: a run is reproducible
+# from this file plus the data, so nothing that affects a result may be hardcoded elsewhere.
+#
+# scripts/run_phase.py freezes a copy into configs/runs/<run_id>/config.yaml and records its
+# SHA-256. That hash appears in split_manifests, model_versions, and the audit log.
+#
+# UNITS ARE STATED FOR EVERY PHYSICAL QUANTITY. A number without a unit is a future bug.
+# Values marked PROVISIONAL are judgment calls awaiting evidence or expert panel review.
+# Values marked MEASURED were established by benchmark on the target machine; the date and the
+# measurement are in docs/DECISIONS.md so a later reader can re-run them.
+
+run:
+  name: "default"
+  seed: 20260911            # single master seed; all others derive from it
+  device: "cpu"             # cpu | cuda. Overridden by PRAXIS_DEVICE. 'mps' retired by D10
+  device_model: null        # filled at runtime: intel-core-ultra-7-256v | nvidia-t4 | nvidia-l4
+  deterministic: true       # CPU: bit-exact. CUDA: tolerance only, see BUILD-SPEC section 0
+  cuda_tolerance: 1.0e-4    # atol for test_cuda_run_is_stable; training only
+  num_workers: 2            # MEASURED: Windows spawns workers as full processes, ~200 MB each
+  log_level: "INFO"
+
+# ---------------------------------------------------------------------------
+# Compute estate. Three machines, three roles. See BUILD-SPEC section 2.1 and D12.
+# Recorded here because R7 requires every number to carry the device it came from.
+# ---------------------------------------------------------------------------
+compute:
+  local:
+    role: "development, inference, every reported number"
+    device: "cpu"
+    total_ram_gb: 15.66             # MEASURED. On-package LPDDR5X, NOT upgradeable
+    typical_free_ram_gb: 1.31       # MEASURED under the normal working load, 91% in use
+    cores: 8                        # 4 P-cores + 4 E-cores, no hyperthreading
+    resnet50_inference_fps: 11.35   # MEASURED at batch 32, 8 threads, float32, no_grad
+  kaggle:
+    role: "feature extraction and training"
+    device: "cuda"
+    gpu: "nvidia-t4"
+    vram_gb: 16
+    weekly_quota_h: 30              # renews weekly
+    session_limit_h: 12             # hard timeout; artefacts must be exported before it
+  colab:
+    # CONFIRMED 2026-09-13: reserved for the full-network M=3 ensemble check that D3 requires
+    # as the honesty test on the shared-backbone deviation. It runs once. Nothing else.
+    role: "full_network_ensemble_check"
+    device: "cuda"
+    compute_units_remaining: 40     # finite and NON-renewing; expires 90 days from purchase
+    unit_burn_per_h: {t4: 2.0, l4: 4.8, a100_40gb: 11.8}   # approximate, verify before use
+    # 40 units is roughly 20 h of T4, 8 h of L4, or 3.4 h of A100. Spend it deliberately.
+    prefer_gpu: "a100_40gb"         # the check needs the memory a T4 does not give at full T
+
+paths:
+  # Two tiers, and the split is deliberate. See D17.
+  #
+  # COLD, EXTERNAL, MAY BE ABSENT. Raw and blurred video is 120 to 600 GB and lives on the
+  # external SSD. It is read once per session by Phase 3 and never again. When the volume is
+  # unmounted, media_objects.reachable goes false and a job needing it fails cleanly. There is
+  # deliberately NO fallback: silently scattering video across drives is worse than stopping.
+  media_root: "${PRAXIS_MEDIA_ROOT}"      # required; unset is a startup error, not a warning
+  #
+  # HOT, LOCAL, ALWAYS PRESENT. Derived artifacts live on B:, a fixed local NTFS volume with
+  # 135.4 GB free. The feature cache is ~7.5 GB for a 100-session corpus, so it fits many times
+  # over, and keeping it here means Stage B training — which reruns for every ensemble member
+  # and every hyperparameter sweep — never waits on a USB drive being plugged in.
+  feature_cache: "B:/praxis/features"
+  pose_artifacts: "B:/praxis/pose"
+  model_weights: "B:/praxis/weights"      # vendored, never downloaded at runtime
+  run_outputs: "B:/praxis/runs"           # metrics, figures, exported artefacts
+  scratch: "B:/praxis/tmp"                # TMPDIR is redirected here
+  torch_home: "B:/praxis/cache/torch"     # TORCH_HOME; keeps ~2 GB of weights off C:
+  #
+  # C: has 18.9 GB free of 452.9 GB and is the Windows volume. Nothing this project generates
+  # may land there. run_phase.py exports TMPDIR and TORCH_HOME from the values above and
+  # refuses to start when C: falls below this floor.
+  min_free_gb_system_drive: 5.0
+
+# ---------------------------------------------------------------------------
+# EXTERNAL BINARIES
+# ---------------------------------------------------------------------------
+# Version-pinned and installed under B:/praxis/tools, not onto C: and not onto PATH. A run
+# resolves these through praxis.tools.resolve, which reads the version back so the manifest
+# records the build that produced the numbers rather than the one that was intended. On Colab
+# and Kaggle a bare "ffmpeg" is correct and is still resolved and recorded. See D42.
+tools:
+  # Bare names, resolved on PATH, and NOT the absolute Windows paths that used to be here. Those
+  # made the container unstartable: configs/ is mounted into the image, so the API imported this
+  # file, looked for B:/praxis/tools/.../ffprobe.exe inside a Linux container, and raised
+  # ToolError at import time before uvicorn could bind. The stack came up with postgres, redis
+  # and the worker healthy and an api that restart-looped.
+  #
+  # Pinning is not lost by this. `praxis.tools.resolve` reads each binary's version back and
+  # records it, so what the run reports is the version that actually produced the numbers rather
+  # than a path somebody wrote down. On this machine PATH finds the pinned 9.0.1 build in
+  # B:/praxis/tools; override with an absolute path here if a second ffmpeg ever shadows it.
+  #
+  # BEWARE across environments: bookworm ships ffmpeg 5.1.x, so a container ingest reads
+  # durations with a different ffprobe from a host ingest's 9.0.1. Both record their version, so
+  # a disagreement is visible rather than silent, but do not treat a corpus ingested in the
+  # container as byte-comparable with one ingested here.
+  ffmpeg: "ffmpeg"
+  ffprobe: "ffprobe"
+
+# ---------------------------------------------------------------------------
+# PHASE 1: ingest and quality gate
+# ---------------------------------------------------------------------------
+ingest:
+  accepted_containers: ["mp4", "mov"]
+  max_upload_bytes: 21474836480          # 20 GiB
+  hash_chunk_bytes: 8388608              # 8 MiB streaming chunks
+
+  # Which corpus this config describes. Environment variables rather than literal paths, because
+  # this file is committed and a manifest path names a directory on one machine. Unset resolves to
+  # null and phase 1 abstains naming the variable. D87.
+  manifest: ${PRAXIS_MANIFEST}
+  media_dir: ${PRAXIS_MEDIA_DIR}
+  keymap: ${PRAXIS_KEYMAP}
+
+  quality_gate:
+    # 40 seconds, not the original 300. The five-minute floor encoded an assumption about how
+    # long a practicum recording would be rather than a requirement of anything downstream.
+    # This is derived: MIN_USEFUL_CLIPS (5) x behaviour.clip.length_s (8.0), enforced by
+    # `the_duration_floor_admits_enough_clips` so the two cannot drift apart. What it still
+    # catches is a fragment too short to contain a behaviour episode at all. D81.
+    min_duration_s: 40
+    max_duration_s: 5400                 # 90 minutes
+    # Frame area and shorter edge, NOT width and height. Half this corpus is portrait phone
+    # video, and a width threshold asks a different question of 576x1024 than of 1024x576 while
+    # the pose model letterboxes both into the same 640 square. 147456 px is 512x288, below
+    # which a teacher at classroom distance is too few pixels to pose reliably; 288 is the
+    # thinnest frame that survives letterboxing with usable detail. D81.
+    min_frame_pixels: 147456
+    min_shorter_edge: 288
+    min_fps: 24.0
+    max_fps_jitter: 2.0                  # fps std dev across the file
+    person_detection_sample_frames: 60   # frames sampled to check a person is present
+    min_person_present_fraction: 0.80
+    min_mean_luminance: 25               # 0-255; below this the room is too dark
+    max_mean_luminance: 230              # above this the image is blown out
+    require_audio: true                  # audio is used for learner-response events only
+    fail_on_warn: false                  # warns are recorded and let through
+
+# ---------------------------------------------------------------------------
+# PHASE 3: preprocessing
+# ---------------------------------------------------------------------------
+preprocess:
+  sample_fps: 8.0                        # must equal behaviour.clip.fps
+
+  pose:
+    model: "yolov8m-pose"
+    export_format: "onnx"                # D10. Runs on CPU locally and CUDA at Kaggle
+    weights_file: "yolov8m-pose.onnx"
+    min_keypoint_confidence: 0.30
+    min_person_confidence: 0.40
+    # The ONNX graph emits one prediction per anchor and suppresses nothing, so this is not a
+    # tuning knob that can be left out: without it a single teacher is returned as dozens of
+    # overlapping bodies and every learner count downstream is wrong by an order of magnitude.
+    # 0.45 is the YOLOv8 default. Raising it toward 1.0 keeps duplicates; lowering it toward 0
+    # merges the genuinely adjacent pupils that a crowded classroom is full of. D77.
+    nms_iou_threshold: 0.45
+    # 60 is NOT a memory budget and must not be lowered to save one. Basic-school classes
+    # are large, and the S2 classroom condition is exactly where the thesis measures shift.
+    # Capping this would silently truncate detections in the condition being studied. Applied
+    # after suppression, so it counts distinct bodies rather than anchors.
+    max_persons_per_frame: 60
+
+  tracking:
+    tracker: "bytetrack"
+    track_high_thresh: 0.50
+    track_low_thresh: 0.10
+    new_track_thresh: 0.60
+    track_buffer_frames: 30
+    match_thresh: 0.80
+
+  teacher_id:
+    # Heuristic score = weighted sum. It PROPOSES; a human confirms. Never trusted alone.
+    weight_presence_duration: 0.40
+    weight_median_bbox_area: 0.30
+    weight_front_zone_time: 0.30
+    min_score_to_propose: 0.35
+    require_human_confirmation: true     # NEVER set false
+    # The floor above is scaled to the weight that was actually measurable: with no marked
+    # zones the front-zone term contributes nothing and a third of the score is unreachable,
+    # so comparing a two-signal score against a three-signal floor refuses sessions for
+    # evidence that was never collected. Derived from the weights, not tuned.
+    max_candidates_recorded: 20          # ranked candidates stored for the reviewer
+
+  blur:
+    # Runs AFTER pose extraction. Order is a privacy requirement, not an optimisation.
+    method: "gaussian"
+    kernel_fraction: 0.35                # of the face box's shorter side
+    dilate_face_box: 1.25                # margin multiplier
+    blur_all_faces: true                 # includes the teacher's
+    delete_original_after_blur: true     # NEVER set false
+    verify_deletion: true
+
+# ---------------------------------------------------------------------------
+# PHASE 4: splits
+# ---------------------------------------------------------------------------
+# The partition is by TEACHER, never by session or by clip. R2. Two sessions from one teacher
+# in different partitions is the same person at train and test time, and the model learns the
+# person. These fractions are of the assignable teacher count, which excludes the held-out
+# college and the teachers who contribute classroom sessions; see D73.
+splits:
+  val_fraction: 0.15
+  test_fraction: 0.20
+  # Which ladder the levels describe. "domain" trains on microteaching and tests on classroom
+  # practicum; "site" holds out a basic school for S1 and a college for S2, which is the only
+  # ladder available once the corpus is practicum throughout. S2 names a different set of
+  # sessions on each, so the axis is written onto the manifest rather than inferred. D98.
+  shift_axis: "domain"
+  # One college withheld entirely. S1 on the domain axis, S2 on the site axis. Null until the
+  # corpus exists and a college can be named; that level cannot be measured while it is null,
+  # and the split generator says so rather than quietly producing a two-level study.
+  heldout_college: null
+  # One basic school withheld entirely, which is S1 on the site axis. Refused on the domain
+  # axis, where a school has no rung. Null until a school can be named. D98.
+  heldout_school: null
+  # Teachers recorded in the basic-school classroom domain are the S2 condition. They are
+  # barred from train and val, and placed in test when they also have microteaching sessions,
+  # so that the S0-to-S2 comparison is within teacher wherever the corpus allows it. D73.
+  classroom_teachers_eligible_for_test: true
+  # Leave false while any microteaching-only teachers exist. Turning it on lets classroom
+  # teachers into train and val, which is the only way to split a corpus that is almost all
+  # classroom footage - and it narrows what the S0-to-S2 drop means, from degradation in a
+  # model that never saw a classroom to degradation across teacher-disjoint partitions. The
+  # manifest records which rule built it so the two can never be read as the same number. D83.
+  classroom_teachers_may_train: false
+  # Two, not one. A test partition holding a single teacher reports that teacher, not the
+  # population, and at this corpus size the distinction is the whole of the external validity
+  # claim. Three is refused outright by `_partition_sizes` at six assignable teachers. D83.
+  min_teachers_per_partition: 2
+
+# ---------------------------------------------------------------------------
+# PHASE 4: behaviour model
+# ---------------------------------------------------------------------------
+behaviour:
+  clip:
+    length_s: 8.0
+    fps: 8.0
+    frames: 64                           # length_s * fps
+    overlap: 0.0                         # non-overlapping; matches the codebook
+    crop_size: 224
+    crop_padding: 1.4                    # around the teacher bbox
+
+  backbone:
+    arch: "resnet50"
+    # The torchvision weights enum, written out in full. NEVER "DEFAULT": that is an alias
+    # torchvision may repoint at a new recipe in any release, and it currently resolves to
+    # IMAGENET1K_V2. A run pinned to an alias would produce different features after a routine
+    # dependency upgrade without one character of this file changing, which is R7 exactly.
+    # V1 rather than V2 is a deliberate choice; see D72.
+    weights: "IMAGENET1K_V1"
+    weights_file: "resnet50-imagenet1k-v1.pt"   # vendored; runtime never downloads, see D58
+    frozen: true                         # always; see BUILD-SPEC section 2.1 and D2
+    output_dim: 2048
+    # The normalisation those weights were trained under. Written here rather than left to
+    # torchvision's transform object because the transform ships with the enum and would
+    # follow a change of enum silently. A crop normalised the wrong way costs accuracy with
+    # no error anywhere.
+    normalise_mean: [0.485, 0.456, 0.406]
+    normalise_std: [0.229, 0.224, 0.225]
+    interpolation: "bilinear"            # how the teacher crop is resized to clip.crop_size
+    cache_dtype: "float16"
+    cache_features: true                 # Stage A. Disabling this does not fit in 1.3 GB
+    # MEASURED: inference costs 429 MB RSS at 32 frames, 378 MB at 8, and throughput is flat
+    # across that range (11.1 to 11.4 fps). Small batches are therefore nearly free.
+    stage_a_batch_frames: 16
+    # MEASURED: 28 min per 40-minute session on this CPU; 47 h for a 100-session corpus.
+    # A T4 does the same work in 0.53 h. Above stage_a_kaggle_threshold_sessions, run Stage A
+    # on Kaggle and import the checksummed cache. See D13.
+    stage_a_kaggle_threshold_sessions: 30
+
+  keypoint_branch:
+    input_keypoints: 17                  # COCO
+    hidden_dim: 256
+    output_dim: 128
+    normalise_by: "bbox"                 # bbox | image | torso_length
+
+  temporal:
+    type: "tcn"
+    layers: 3
+    kernel_size: 3
+    dilations: [1, 2, 4]
+    channels: 512
+    dropout: 0.20
+    residual: true
+
+  pooling:
+    type: "attention"
+    attention_dim: 128
+
+  heads:
+    presence_behaviours: ["B1", "B2", "B3", "B4", "B5"]
+    intensity_behaviours: ["B1", "B2", "B3", "B4", "B5"]
+
+  augmentation:
+    # Horizontal flip inverts orientation and position, so it is FORBIDDEN for B2 and B3.
+    # This is a per-behaviour mask, not a global switch. Easy bug to ship, hard to find later.
+    horizontal_flip:
+      enabled: true
+      applies_to: ["B1", "B4"]
+      probability: 0.5
+    colour_jitter:
+      # NOT APPLIED, and `applied` is what the code reads. D75: Stage A caches the frozen
+      # backbone's output once per clip, and a 2048-dimensional activation cannot be
+      # recoloured afterwards. Applying this would mean caching a fixed number of jittered
+      # renderings per clip, which turns a fresh draw each epoch into a draw from a handful of
+      # fixed ones and weakens the augmentation to little purpose.
+      #
+      # Setting this true is a hard error until the Stage A variant path is built, rather than
+      # a silent no-op. Configuration that quietly does nothing is the failure mode R1 to R7
+      # exist to prevent.
+      applied: false
+      brightness: 0.20
+      contrast: 0.20
+      saturation: 0.15
+      applies_to: ["B1", "B2", "B3", "B4", "B5"]
+    # Applied. Acts on the frame axis, which the feature cache keeps, so it works in Stage B.
+    temporal_jitter_frames: 4
+    # NOT APPLIED, for the same reason as colour_jitter: a random crop is a pixel operation and
+    # by Stage B the pixels are gone. Kept so the decision is visible rather than erased. D75.
+    random_crop_scale: [0.85, 1.0]
+
+  train:
+    epochs: 60
+    batch_size: 32                       # Stage B runs on cached features; this is cheap
+    optimiser: "adamw"
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-4
+    scheduler: "cosine"
+    warmup_epochs: 3
+    grad_clip_norm: 1.0
+    mixed_precision: false               # no benefit on a CPU build; measure before enabling
+    # Session length in this corpus runs 59s to 32 minutes, which is 7 clips against 243.
+    # Uncapped, two sessions supply 73% of the training signal and every clip from one shares a
+    # teacher, a room, a camera and a light level, so the model learns the room.
+    #
+    # "median" costs volume: on this corpus it takes 584 clips to 147 and the largest session
+    # from 42% of training to 10%. That is a smaller loss than it looks, because 243 clips cut
+    # from one continuous recording of one room are nowhere near 243 independent observations -
+    # but it is a real loss, and which setting generalises better is an empirical question that
+    # the validation partition settles rather than this comment. Revisit it once there is a
+    # trained model; an integer or null are the alternatives. D84.
+    max_clips_per_session: "median"
+    early_stopping:
+      monitor: "val_macro_f1"
+      patience: 10
+      min_delta: 0.002
+
+  loss:
+    presence: "focal"
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    intensity: "masked_mse"
+    intensity_weight: 0.30               # relative to presence loss
+    mask_nonscorable: true
+
+  baselines:
+    # All three are required for the frozen report. Not optional.
+    - "majority_class"
+    - "keypoints_gbdt"
+    - "frame_averaged_resnet"
+
+# ---------------------------------------------------------------------------
+# PHASE 5: calibration
+# ---------------------------------------------------------------------------
+calibration:
+  methods: ["temperature", "ensemble", "mc_dropout"]
+  primary: "ensemble"                    # Ovadia et al.: ensembles hold up best under shift
+
+  temperature:
+    # Guo et al. baseline. The thesis predicts this FAILS under shift; that is the point.
+    init_T: 1.0
+    max_iter: 200
+    lr: 0.01
+    fit_on: "val"                        # i.i.d. validation split, never test
+
+  ensemble:
+    size: 5                              # M
+    share_backbone: true                 # deviation from Ovadia; must be tested, see below
+    train_sequentially: true             # parallel training exhausts the 1.3 GB headroom
+    vary: ["init_seed", "data_order"]
+    # Every member must train on the SAME device model. R7 forbids mixing devices within one
+    # experimental comparison, and an ensemble is one comparison. See D14.
+    require_same_device_model: true
+    full_network_check:
+      enabled: true                      # the honesty check on share_backbone
+      size: 3
+      behaviour: "B1"
+      reduced_frames: 32
+
+  mc_dropout:
+    rate: 0.20
+    passes: 20
+
+  metrics:
+    ece_bins: 15                         # standard setting
+    compute: ["ece", "mce", "brier", "nll"]
+    reliability_diagram: true
+    bootstrap_samples: 1000
+    ci_level: 0.95
+
+# ---------------------------------------------------------------------------
+# PHASE 6: domain shift and OOD
+# ---------------------------------------------------------------------------
+shift:
+  levels:
+    # These name the rungs of the site axis, which is where the thesis's finding comes from.
+    # On the domain axis S1 is a held-out college's microteaching and S2 is all classroom
+    # footage; splits.shift_axis says which is in force, and the manifest records it. D98.
+    S0: "iid_practicum_heldout_teachers"
+    S1: "heldout_school_practicum"
+    S2: "heldout_college_practicum"
+
+  attribution:
+    model: "mixed_effects"
+    random_intercept: "teacher_id"
+    covariates:
+      - "camera_distance_m"
+      - "room_area_m2"
+      - "pupil_count"
+      - "ambient_noise_dba"
+      - "teacher_movement_range_m"
+    report_ci: true
+
+ood:
+  methods: ["msp", "ensemble_disagreement", "mahalanobis"]
+  primary: "ensemble_disagreement"
+
+  msp:
+    description: "Hendrycks and Gimpel baseline. Required for comparison."
+  mahalanobis:
+    feature_layer: "penultimate"
+    class_conditional: true
+    shrinkage: 0.10
+
+  evaluation:
+    report: ["auroc", "fpr_at_95_tpr", "flag_rate_by_domain"]
+
+  abstention:
+    # Chosen by sweep against a stated criterion, never by eye. Parasuraman and Riley:
+    # neglect of automation is driven by false alarms when base rates are ignored.
+    sweep_from: 0.0
+    sweep_to: 1.0
+    sweep_steps: 101
+    selection_criterion: "max_f1_at_suppression_rate_below_0.30"
+    max_acceptable_suppression_rate: 0.30    # PROVISIONAL, revise after the sweep
+    chosen_threshold: null                   # filled by Phase 6, then frozen
+
+# ---------------------------------------------------------------------------
+# PHASE 7: explanation
+# ---------------------------------------------------------------------------
+explain:
+  method: "gradcam"                      # switched to intrinsic automatically on failure
+  fallback: "intrinsic"
+
+  gradcam:
+    target_layer: "backbone.layer4"
+    normalise: true
+
+  fidelity:
+    # Adebayo et al. sanity checks. A method that fails is removed from the UI, and the
+    # failure is reported in the thesis rather than buried.
+    run_parameter_randomisation: true
+    run_data_randomisation: true
+    similarity_metrics: ["spearman_rank", "ssim"]
+    fail_threshold_rank_corr: 0.60       # similarity above this after randomisation = FAIL
+    deletion_insertion_auc: true
+    deletion_steps: 20
+
+# ---------------------------------------------------------------------------
+# PHASE 8: routing gate
+# ---------------------------------------------------------------------------
+routing:
+  present_when:
+    min_calibrated_prob: 0.70            # PROVISIONAL until Phase 6 sweep completes
+    ood_flag: false
+  escalate_when:
+    min_epistemic: 0.15                  # PROVISIONAL
+  # Everything else suppresses. Suppression removes the value from the payload entirely.
+  suppress_removes_value_from_payload: true    # NEVER set false
+
+  evidence_before_suggestion:
+    enabled: true                        # the cognitive forcing function
+    require_reveal_action: true
+    # The reliance study needs an always-on comparison arm; set per participant, not per client.
+
+# ---------------------------------------------------------------------------
+# PHASE 2: annotation and agreement
+# ---------------------------------------------------------------------------
+annotation:
+  codebook_version: "v1.0-draft"
+  calibration_rounds: 2
+  calibration_clips_per_round: 100
+  calibration_min_teachers: 4
+  alpha_gate: 0.667                      # production annotation is blocked below this
+  exclude_guesses_from_primary_irr: true
+  bootstrap_samples: 1000
+
+  irr:
+    categorical: "krippendorff_alpha"
+    ordinal: "weighted_kappa_quadratic"
+    continuous: "icc_2k"
+    warn_when_not_fully_crossed: true    # ICC underestimates in that case
+
+  artefact_checks:
+    restriction_of_range: true
+    rater_role_effects: true
+    familiarity_effects: true
+
+# ---------------------------------------------------------------------------
+# PHASE 10: reliance study
+# ---------------------------------------------------------------------------
+reliance_study:
+  seeded_errors:
+    rate: 0.10                           # PROVISIONAL. Covered by evaluator consent
+    corruption_kinds: ["flip_presence", "shift_count", "wrong_category"]
+    seed_offset: 1000                    # derived from run.seed, keeps seeding reproducible
+  arms: ["dossier", "no_dossier"]
+  counterbalance: true
+  target_participants: 14                # recruit 14 to retain 10
+  sessions_per_participant: 6
+
+# ---------------------------------------------------------------------------
+# Dashboard and export
+# ---------------------------------------------------------------------------
+dashboard:
+  min_cell_size: 5                       # cohort cells below this are refused, not blurred
+  show_confidence_bands: true
+  mark_suppressed_sessions: true         # marked, never omitted
+
+export:
+  require_adjudication: true             # NEVER set false. No unreviewed output leaves
+  format: "pdf"
+  include_evidence_timestamps: true
+
+# ---------------------------------------------------------------------------
+# Retention, per Act 843
+# ---------------------------------------------------------------------------
+retention:
+  blurred_media_years: 5
+  pose_artifacts_years: 5
+  audit_log: "permanent"
+  run_nightly_at: "02:00"
+  dry_run: false
+
+# ---------------------------------------------------------------------------
+# Values that must never change without a DECISIONS.md entry
+# ---------------------------------------------------------------------------
+locked:
+  - "preprocess.blur.delete_original_after_blur"
+  - "preprocess.teacher_id.require_human_confirmation"
+  - "preprocess.pose.max_persons_per_frame"
+  - "routing.suppress_removes_value_from_payload"
+  - "export.require_adjudication"
+  - "behaviour.augmentation.horizontal_flip.applies_to"
+  - "calibration.ensemble.full_network_check.enabled"
+  - "calibration.ensemble.require_same_device_model"

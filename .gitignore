@@ -1,0 +1,52 @@
+# Generated or reproducible.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node
+node_modules/
+.vite/
+dist/
+
+# Secrets and local environment
+.env
+.env.*
+
+# Model weights. Vendored from upstream by scripts/vendor_weights.py, licence-encumbered and
+# large, so loading them is an operator step rather than a repository artefact.
+system/weights/*
+!system/weights/.gitkeep
+
+# Run outputs, caches and collected media.
+runs/
+data/
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Anything that could re-identify a participant. The database holds no teacher name or code by
+# design (R1), and committing any of these would undo that in one line. The pseudonym key maps
+# field-log codes to teacher identifiers; a drafted manifest's filename column holds real paths,
+# and a corpus assembled by hand has directories named after the people in the footage.
+keys/
+*pseudonyms*.csv
+sessions-draft.csv
+sessions-pending.csv
+sessions.csv
+consents.csv
+
+# Editor and OS noise
+~$*
+*.tmp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
