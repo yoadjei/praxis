@@ -1,0 +1,92 @@
+# The seven PRAXIS invariants, on every push and every pull request.
+#
+# This is the half of BUILD-SPEC section 0's promise that the local pre-commit hook cannot make:
+# a check that runs on a machine other than the author's, from a clean checkout, with no state
+# carried over from a developer's environment. It only takes effect once this repository has a
+# remote on GitHub. Until then hooks/pre-commit is the enforcement.
+#
+# The full suite runs alongside the invariants because a phase test failing is how a regression in
+# an invariant usually announces itself first. No test count is quoted here on purpose: the figure
+# that was quoted went stale within a fortnight, and a comment nobody can check is worse than none.
+
+name: invariants
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  invariants:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: system
+
+    # R5 is "the audit trail is append-only AT THE DATABASE LEVEL", and the assertion that means
+    # anything is a trigger refusing an UPDATE from a superuser. With no server here that half of
+    # the test was guarded out and R5 passed on its Python half alone, so the one invariant
+    # explicitly about PostgreSQL was the one never enforced anywhere but the author's machine.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: praxis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Pointed at `postgres` because the suite creates and drops a scratch database per session,
+      # so the connecting user needs CREATE DATABASE. Set here rather than discovered: when this
+      # is set and the server is unreachable `tests/conftest.py` raises, which is what keeps "no
+      # database configured" from looking like "database configured and down".
+      PRAXIS_TEST_DSN: host=127.0.0.1 port=5432 dbname=postgres user=postgres password=praxis
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # BUILD-SPEC section 2 pins Python 3.11 exactly. The development machine currently runs
+      # 3.14, which DECISIONS.md D11 records as a deferred pin. CI holds the specified version,
+      # so a divergence between the two shows up here rather than in a result nobody can
+      # reproduce.
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -s requirements.lock ] && grep -qv '^\s*#' requirements.lock; then
+            pip install -r requirements.lock
+          else
+            pip install -e '.[dev]' || pip install -e .
+          fi
+
+      # Named as its own step so that a failure here is unmistakable in the run summary. R1 to R7
+      # override everything else in this system: violating one invalidates the research rather
+      # than breaking a feature.
+      - name: The seven invariants
+        run: python -m pytest tests/test_invariants.py -q --no-header
+
+      # The header stays on here, and only here, because pytest-randomly reports the order it
+      # chose in it. Six tests in this suite were found asserting corpus-wide figures against
+      # whatever earlier tests had written, and a shuffled order is what catches that class; but
+      # a shuffle whose seed is not recorded turns a real failure into one nobody can reproduce.
+      # `--no-header` would hide the one line needed to re-run it: `-p randomly
+      # --randomly-seed=<the seed from the log>`. See L26.
+      - name: Full suite
+        run: python -m pytest -q
+
+      - name: Lint
+        run: |
+          python -m pip install ruff
+          python -m ruff check .

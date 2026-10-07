@@ -1,0 +1,57 @@
+#!/bin/sh
+# Run the seven PRAXIS invariants before every commit.
+#
+# BUILD-SPEC section 0 says each invariant "has an automated test in tests/test_invariants.py
+# that runs in CI on every commit". Until this hook existed that sentence was false: there were
+# no commits, no CI, and the tests ran only when somebody remembered. This makes it true for the
+# local case. .github/workflows/invariants.yml covers the remote case once a remote exists.
+#
+# WHY THIS FAILS LOUDLY RATHER THAN SKIPPING. If pytest cannot run, this hook blocks the commit
+# and says why. It would be easier to let the commit through with a warning, and that is exactly
+# the failure this project has already met once: DECISIONS.md D56 records an invariant test that
+# asserted an environment variable ultralytics does not have, and passed for that reason. The
+# lesson written from it is that an unenforced invariant is a gap, but an invariant guarded by a
+# passing assertion is a lie. A hook that waves commits through when it cannot check them is the
+# same lie in a different place.
+#
+# To bypass deliberately: git commit --no-verify. That is a decision, and it leaves a trace in
+# your shell history rather than passing silently.
+
+set -e
+
+ROOT="$(git rev-parse --show-toplevel)"
+SYSTEM="$ROOT/system"
+
+# Nothing to check if the system tree is not part of this checkout.
+if [ ! -d "$SYSTEM" ]; then
+    exit 0
+fi
+
+PYTHON="${PRAXIS_PYTHON:-python}"
+
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+    echo "pre-commit: '$PYTHON' is not on PATH, so the invariants cannot be checked." >&2
+    echo "            Set PRAXIS_PYTHON to the interpreter, or commit with --no-verify" >&2
+    echo "            if you have decided to skip the check." >&2
+    exit 1
+fi
+
+if ! "$PYTHON" -c "import pytest" >/dev/null 2>&1; then
+    echo "pre-commit: pytest is not installed for '$PYTHON', so the invariants cannot be" >&2
+    echo "            checked. Install it, or commit with --no-verify deliberately." >&2
+    exit 1
+fi
+
+echo "pre-commit: checking the seven invariants (R1 to R7)..."
+
+if ! (cd "$SYSTEM" && "$PYTHON" -m pytest tests/test_invariants.py -q --no-header \
+        -p no:cacheprovider); then
+    echo "" >&2
+    echo "pre-commit: an invariant failed. The commit is blocked." >&2
+    echo "            These seven rules override everything else in this system; violating one" >&2
+    echo "            invalidates the research rather than merely breaking a feature. Fix the" >&2
+    echo "            cause, do not bypass the check." >&2
+    exit 1
+fi
+
+echo "pre-commit: invariants hold."
