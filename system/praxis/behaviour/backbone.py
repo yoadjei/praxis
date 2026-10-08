@@ -29,6 +29,22 @@ from pathlib import Path
 CLASSIFIER_ATTRIBUTE = "fc"
 
 
+def version_of(arch: str, weights_name: str) -> str:
+    """The one spelling of a backbone's identity, for everything that records or compares it.
+
+    `resnet50/IMAGENET1K_V1` rather than `resnet50`. The feature cache stores this against every
+    clip and refuses a mismatch on read, and it has to be able to name the configured backbone
+    without loading the weights to ask one - so the composition lives here rather than only on
+    the instance, and the two cannot drift.
+    """
+    return f"{arch}/{weights_name}"
+
+
+def declared_version(config) -> str:
+    """What `build_backbone(config)` would call itself, without building it."""
+    return version_of(config.behaviour.backbone.arch, config.behaviour.backbone.weights)
+
+
 class BackboneError(RuntimeError):
     """The frame encoder could not be built, with the reason distinguished."""
 
@@ -112,7 +128,7 @@ class FrozenBackbone:
         not identify the features and two runs differing only in this would otherwise be
         indistinguishable in the artefact record.
         """
-        return f"{self.arch}/{self.weights_name}"
+        return version_of(self.arch, self.weights_name)
 
     @property
     def module(self):

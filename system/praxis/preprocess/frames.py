@@ -116,6 +116,40 @@ def gray_at(ffmpeg: Tool, path, *, at_seconds: float, width: int,
     return buffer[:expected].reshape(height, width)
 
 
+def rgb_at(ffmpeg: Tool, path, *, at_seconds: float, width: int, height: int,
+           box: tuple[int, int, int, int] | None = None) -> np.ndarray:
+    """One frame as a `(height, width, 3)` array of 8-bit RGB, optionally cropped first.
+
+    What Stage A feeds the backbone. Raw rather than JPEG because the crop is about to become a
+    2048-dimensional activation and a lossy round trip through an encoder would put compression
+    artefacts into every cached feature for no gain.
+
+    `box` is `(x, y, w, h)` in source pixels and **crop precedes scale**, the same order and for
+    the same reason as `jpeg_at`: scaling first moves the rectangle, so a box derived from the
+    pose artefact's coordinates would land somewhere else in the room. The scale is exact rather
+    than aspect-preserving, because the backbone wants a square and a letterboxed crop would
+    spend part of its input on bars.
+    """
+    chain = f"scale={width}:{height}"
+    if box is not None:
+        x, y, crop_width, crop_height = box
+        if crop_width < 2 or crop_height < 2:
+            raise frame_unreadable(
+                f"a {crop_width}x{crop_height} crop is not an image; the region asked for is "
+                f"smaller than a pixel pair")
+        chain = f"crop={crop_width}:{crop_height}:{x}:{y},{chain}"
+
+    raw = _decode(ffmpeg, path, at_seconds=at_seconds,
+                  arguments=("-vf", chain, "-pix_fmt", "rgb24", "-f", "rawvideo"))
+    expected = width * height * 3
+    buffer = np.frombuffer(raw, dtype=np.uint8)
+    if buffer.size < expected:
+        raise frame_unreadable(
+            f"the decoded frame is {buffer.size} bytes and a {width}x{height} RGB frame is "
+            f"{expected}; the filter chain did not produce the size it was asked for")
+    return buffer[:expected].reshape(height, width, 3)
+
+
 def gray_sequence(ffmpeg: Tool, path, *, count: int, duration_s: float, width: int,
                   height: int) -> list[np.ndarray]:
     """`count` frames spread evenly across the file, as grayscale arrays.

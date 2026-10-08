@@ -96,3 +96,24 @@ def clip_plan(
         clips.append(ClipRef(session_id, n_full, tail_start, duration_seconds))
 
     return tuple(clips)
+
+
+def plan_from_config(session_id: str, duration_seconds: float, config) -> tuple[ClipRef, ...]:
+    """The clip plan both callers use, so a clip means one thing.
+
+    **Partial tails are dropped, not kept short.** `min_tail_seconds` is `length_s` rather
+    than half of it, which was the previous value and carried a TODO asking for a config key.
+    The key is not the fix. Stage A samples `behaviour.clip.frames` across whatever span a clip
+    has, so a five-second clip reaches the model as 64 frames at 12.8 fps while the config
+    declares 8, and the temporal head sees a short clip as a long one played slowly. Nothing
+    downstream reports that; the shapes agree and the loss falls.
+
+    Dropping the tail costs up to `length_s` of footage per session - under a minute across
+    this corpus - and buys the guarantee `ClipSection.frames_match_length_and_rate` already
+    asserts about the configuration: that length, rate and frame count describe one another. A
+    clip is the unit of analysis the codebook is written against, and the codebook describes
+    eight-second clips. D99.
+    """
+    clip = config.behaviour.clip
+    return clip_plan(session_id, duration_seconds,
+                     clip_seconds=clip.length_s, min_tail_seconds=clip.length_s)
