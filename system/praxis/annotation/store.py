@@ -26,6 +26,7 @@ from praxis.db.schema import (
     annotation_assignments,
     annotations,
     codebook_revisions,
+    sessions,
 )
 
 
@@ -235,6 +236,14 @@ def queue_for(
     assignment is "done" when an annotation row exists with the same assignment_id
     and behaviour, so we exclude those.
 
+    **An excluded session's assignments are withheld.** A round planned before the exclusion
+    still holds its rows - this table is append-only, so retiring them is not available and
+    would not be wanted either, since the plan is the record of what was asked for. But D96
+    decided that session is not annotated, and `plan_annotation.py` already refuses to put it
+    in a new round. A queue that served it anyway would make the exclusion mean one thing when
+    planning and another when labelling, and the rater is the one place where that costs hours
+    of somebody's attention.
+
     Arguments:
         conn: an active database connection
         rater_id: the rater to queue for
@@ -248,6 +257,10 @@ def queue_for(
     """
     query = select(annotation_assignments).where(
         annotation_assignments.c.rater_id == rater_id,
+        select(sessions.c.session_id)
+        .where(sessions.c.session_id == annotation_assignments.c.session_id,
+               sessions.c.excluded_at.is_(None))
+        .exists(),
     )
 
     if round_name is not None:

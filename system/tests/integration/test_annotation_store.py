@@ -37,6 +37,7 @@ from praxis.db.schema import (
     teachers,
 )
 from praxis.ids import new_ulid
+from praxis.ingest.exclusion import exclude, reinstate
 from tests.integration.conftest import requires_database
 
 
@@ -621,6 +622,39 @@ class TestQueueFor:
             results = queue_for(conn, rater_id, round_name="calibration-2")
             assert len(results) == 1
             assert results[0].assignment_id == assignment_r2.assignment_id
+
+    def test_an_excluded_session_is_not_served_to_a_rater(self, engine, calibration_data):
+        """D96 excludes a session from annotation. The queue has to agree with the plan.
+
+        `plan_annotation.py` refuses to put an excluded session in a new round, but the rounds
+        already planned keep their rows - the table is append-only. The research corpus is in
+        exactly that state: two thirds of the standing assignments belong to a session excluded
+        after they were issued. If the queue served them, the rule would hold at planning time
+        and fail at the one point where a person spends hours acting on it.
+        """
+        if not requires_database(engine):
+            return
+
+        session_id = calibration_data["session_id"]
+        rater_id = new_ulid()
+        assignment = Assignment(
+            assignment_id=new_ulid(), rater_id=rater_id, behaviour="B1",
+            clip=ClipRef(session_id=session_id, clip_index=0, start_seconds=0.0,
+                         end_seconds=8.0),
+            round_name="calibration-1")
+
+        with transaction(engine) as conn:
+            record_assignments(conn, (assignment,))
+            assert len(queue_for(conn, rater_id)) == 1, "the fixture session is annotatable"
+
+            exclude(conn, session_id=session_id, excluded_by=new_ulid(),
+                    reason="camera framing cuts the teacher out of frame")
+            assert queue_for(conn, rater_id) == ()
+
+            reinstate(conn, session_id=session_id, reinstated_by=new_ulid(),
+                      reason="re-examined; the teacher is in frame for most of it")
+            assert len(queue_for(conn, rater_id)) == 1, (
+                "a restored session is annotatable again; the assignment was never retired")
 
 
 class TestAdoptCodebookRevision:

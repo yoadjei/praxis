@@ -372,6 +372,11 @@ def test_summary_reports_annotation_assignments_and_counts(
     The assignment count and annotation count can diverge (not all assignments
     receive an annotation). Both are reported so the UI can show assignment
     queue depth.
+
+    `assignments` counts what a rater can still be served and `annotations` counts labelling
+    already done, so the two are not nested: an excluded session keeps its completed
+    annotations and loses its pending assignments. The ordering assertion this test used to
+    make held only while nothing was excluded.
     """
     if not requires_database(client, dashboard_setup):
         return
@@ -380,13 +385,37 @@ def test_summary_reports_annotation_assignments_and_counts(
     assert response.status_code == 200
 
     body = response.json()
-    # Both fields must be present and non-negative.
-    assert "assignments" in body["annotation"]
-    assert "annotations" in body["annotation"]
-    assert body["annotation"]["assignments"] >= 0
-    assert body["annotation"]["annotations"] >= 0
-    # Annotations should not exceed assignments.
-    assert body["annotation"]["annotations"] <= body["annotation"]["assignments"]
+    for field in ("assignments", "annotations", "withheld_assignments"):
+        assert field in body["annotation"]
+        assert body["annotation"][field] >= 0
+
+
+def test_excluding_a_session_moves_its_assignments_into_the_withheld_count(
+    client, dashboard_setup, engine
+) -> None:
+    """The headline figure has to be the work a rater will actually be offered.
+
+    `annotation_assignments` is append-only, so excluding a session leaves its rows standing.
+    Counting them as pending tells the operator there is labelling waiting that `queue_for`
+    will never serve - the research corpus is in that state, with two thirds of its standing
+    assignments belonging to one excluded session. The withheld figure is reported beside the
+    live one so the drop is visible rather than mysterious.
+    """
+    if not requires_database(client, dashboard_setup, engine):
+        return
+
+    before = client.get("/api/v1/dashboard/summary").json()["annotation"]
+    assert before["assignments"] >= 1, "the fixture issues an assignment to annotate"
+
+    with transaction(engine) as conn:
+        exclude(conn, session_id=dashboard_setup["session_id_2"], excluded_by=new_ulid(),
+                reason="the teacher leaves frame for most of the recording")
+
+    after = client.get("/api/v1/dashboard/summary").json()["annotation"]
+    assert after["assignments"] == before["assignments"] - 1
+    assert after["withheld_assignments"] == before["withheld_assignments"] + 1
+    assert after["annotations"] == before["annotations"], (
+        "labelling already done is not undone by excluding the session it was done on")
 
 
 def test_sessions_endpoint_returns_200_with_proper_structure(client) -> None:

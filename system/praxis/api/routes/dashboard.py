@@ -109,16 +109,32 @@ def get_summary(request: Request) -> dict[str, Any]:
             "total_sessions": int(total_sessions),
         }
 
-        # Annotation progress: assignments and annotations.
-        total_assignments = conn.execute(
+        # Annotation progress. Assignments are counted the way `queue_for` serves them, which
+        # means an excluded session's rows are left out of both numbers. The table is
+        # append-only, so a round planned before an exclusion keeps its assignments; counting
+        # them here would report work waiting that no rater will ever be offered. The withheld
+        # count is reported beside the live one rather than folded away, because a reader who
+        # remembers a larger figure needs to see where it went (D96).
+        annotatable = (
+            select(sessions.c.session_id)
+            .where(sessions.c.session_id == annotation_assignments.c.session_id,
+                   sessions.c.excluded_at.is_(None))
+            .exists())
+        live_assignments = conn.execute(
+            select(func.count(annotation_assignments.c.assignment_id)).where(annotatable)
+        ).scalar() or 0
+        all_assignments = conn.execute(
             select(func.count(annotation_assignments.c.assignment_id))
         ).scalar() or 0
+        # Annotations stay a plain count. Excluding a session does not undo labelling somebody
+        # already did, and this number means work completed rather than work waiting.
         total_annotations = conn.execute(
             select(func.count(annotations.c.annotation_id))
         ).scalar() or 0
         summary["annotation"] = {
-            "assignments": int(total_assignments),
+            "assignments": int(live_assignments),
             "annotations": int(total_annotations),
+            "withheld_assignments": int(all_assignments - live_assignments),
         }
 
         # Audit log: latest entry as a timestamp.

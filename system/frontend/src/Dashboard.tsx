@@ -352,7 +352,12 @@ export function Dashboard(props: {
         <Stat
           label="Annotations"
           value={String(summary.annotation.annotations)}
-          detail={`${summary.annotation.assignments} assignments`}
+          detail={
+            summary.annotation.withheld_assignments > 0
+              ? `${summary.annotation.assignments} assignments · ` +
+                `${summary.annotation.withheld_assignments} withheld from excluded sessions`
+              : `${summary.annotation.assignments} assignments`
+          }
         />
         <Stat
           label="Model"

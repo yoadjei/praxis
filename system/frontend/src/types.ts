@@ -93,7 +93,12 @@ export interface AnnotationRefusedError {
 export interface DashboardSummary {
   corpus_by_domain: Record<string, Record<string, number>>;
   preprocessing: { preprocessed_count: number; total_sessions: number };
-  annotation: { assignments: number; annotations: number };
+  annotation: {
+    assignments: number;
+    annotations: number;
+    /** Assignments belonging to an excluded session. Planned, never served, not retired. */
+    withheld_assignments: number;
+  };
   last_audit_at: string | null;
   model: { status: string } & Record<string, unknown>;
   confidence_distribution: { status?: string } & Record<string, unknown>;

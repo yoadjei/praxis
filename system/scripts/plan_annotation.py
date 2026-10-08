@@ -381,7 +381,11 @@ def main(argv: list[str] | None = None) -> int:
 
     is_calibration = _is_calibration_round(args.round)
     clip_seconds = config.behaviour.clip.length_s
-    min_tail_seconds = 4.0  # TODO: add config key for this
+    # A partial tail is dropped rather than kept as a short clip. This was 4.0 with a TODO
+    # asking for a config key; the key was never the fix. See `clips.plan_from_config`: Stage A
+    # samples a fixed frame count across whatever span a clip has, so a short clip reaches the
+    # model at a different frame rate from the one the config declares. D99.
+    min_tail_seconds = clip_seconds
 
     engine = build_engine()
     already_exist = 0
